@@ -3107,8 +3107,10 @@ impl Recorder {
         // Mode "gpu": own zero-copy pipeline (gpucap.rs). Mode "cpu": ffmpeg ddagrab + CPU copy + AMF.
         // ffmpeg-only zero-copy routes all fail on this PC (scale_d3d11, AMF hwmap/vpp_amf, h264_mf).
         // CPU fallback tries each vendor's encoder: AMD, NVIDIA, Intel.
+        // "gdi": last resort - GDI desktop capture needs no DXGI output at all, and on some hybrid-GPU
+        // systems DXGI exposes none, which makes every ddagrab / DuplicateOutput mode above fail.
         #[cfg(windows)]
-        let all = ["gpu", "cpu", "cpu-nvenc", "cpu-qsv"];
+        let all = ["gpu", "cpu", "cpu-nvenc", "cpu-qsv", "gdi", "gdi-x264"];
         #[cfg(not(windows))]
         let all = ["gpu"];
         let mode_file = std::env::temp_dir().join("clipper_mode_v7.txt");
@@ -3144,17 +3146,23 @@ impl Recorder {
                 }
             } else {
                 let c = match cfg.codec.as_str() { "hevc" => "hevc", "av1" => "av1", _ => "h264" };
+                // GDI desktop capture (last resort): ffmpeg grabs the composited desktop itself, so there is
+                // no DXGI output to find and no hwdownload - the frames arrive on the CPU as BGRA.
+                let gdi = mode == "gdi" || mode == "gdi-x264";
                 // smart bitrate: constant quality with the bitrate setting as the ceiling (see gpucap.rs); else CBR
                 let peak = format!("{}M", cfg.bitrate_mbps);
                 let buf = format!("{}M", cfg.bitrate_mbps * 2);
                 let rc: Vec<&str> = match (mode, cfg.smart_bitrate) {
-                    ("cpu-nvenc", true) => vec!["-rc", "vbr", "-maxrate", &peak, "-bufsize", &buf],
+                    ("gdi-x264", _) => vec![], // libx264 has no -rc; -b:v below is its CBR target
+                    ("gdi", true) | ("cpu-nvenc", true) => vec!["-rc", "vbr", "-maxrate", &peak, "-bufsize", &buf],
                     ("cpu-qsv", true) => vec!["-maxrate", &peak, "-bufsize", &buf],
                     (_, true) => vec!["-rc", "vbr_peak", "-maxrate", &peak],
                     ("cpu-nvenc", false) | (_, false) if mode != "cpu-qsv" => vec!["-rc", "cbr"],
                     _ => vec![],
                 };
                 let mut enc: Vec<String> = match mode {
+                    "gdi" => vec!["-c:v".into(), format!("{c}_nvenc"), "-preset".into(), "p3".into(), "-tune".into(), "ll".into()],
+                    "gdi-x264" => vec!["-c:v".into(), "libx264".into(), "-preset".into(), "ultrafast".into(), "-tune".into(), "zerolatency".into()],
                     "cpu-nvenc" => vec!["-c:v".into(), format!("{c}_nvenc"), "-preset".into(), "p3".into(), "-tune".into(), "ll".into()],
                     "cpu-qsv" => vec!["-c:v".into(), format!("{c}_qsv"), "-preset".into(), "veryfast".into()],
                     _ => vec!["-c:v".into(), format!("{c}_amf"), "-quality".into(), "speed".into()],
@@ -3164,10 +3172,22 @@ impl Recorder {
                 let pct = if cfg.smart_quality <= 72 { 60 } else if cfg.smart_quality <= 82 { 75 } else { 90 };
                 let avg = if cfg.smart_bitrate { format!("{}k", cfg.bitrate_mbps * 10 * pct) } else { peak.clone() };
                 // explicit full-range RGB -> TV-range BT.709 conversion (else clips come out dark)
-                let mut v: Vec<String> = vec![
-                    "-filter_complex".into(), format!("{grab},hwdownload,format=bgra{scale},scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=nv12[v]"),
-                    "-map".into(), "[v]".into(),
-                ];
+                let src = if gdi {
+                    // gdigrab is input 1 (the audio pipe is input 0); it already delivers BGRA on the CPU
+                    format!("[1:v]format=bgra{scale},scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=nv12[v]")
+                } else {
+                    format!("{grab},hwdownload,format=bgra{scale},scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=nv12[v]")
+                };
+                let mut v: Vec<String> = if gdi {
+                    vec![
+                        "-f".into(), "gdigrab".into(), "-framerate".into(), cfg.fps.to_string(),
+                        "-draw_mouse".into(), (cfg.capture_cursor as u8).to_string(),
+                        "-i".into(), "desktop".into(),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                v.extend(["-filter_complex".into(), src, "-map".into(), "[v]".into()]);
                 v.extend(enc);
                 v.extend(["-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"].map(String::from));
                 v.extend(["-b:v".to_string(), avg, "-g".to_string(), (cfg.fps * SEG).to_string()]);
@@ -3208,7 +3228,7 @@ impl Recorder {
                 REC_LOG_POS.store(fs::metadata(log_path()).map(|m| m.len()).unwrap_or(0), Ordering::Relaxed);
                 REC_STARTED_MS.store(now_ms(), Ordering::Relaxed);
                 log_line(&format!("recording: {} ({} Hz, {} ch)",
-                    if mode == "gpu" { "ZERO-COPY gpu pipeline" } else { "cpu copy fallback" }, rate, ch));
+                    if mode == "gpu" { "ZERO-COPY gpu pipeline" } else if mode.starts_with("gdi") { "GDI desktop capture" } else { "cpu copy fallback" }, rate, ch));
                 return Ok(());
             }
             stop.store(true, Ordering::Relaxed);
