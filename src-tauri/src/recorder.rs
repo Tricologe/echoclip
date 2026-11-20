@@ -3109,8 +3109,10 @@ impl Recorder {
         // CPU fallback tries each vendor's encoder: AMD, NVIDIA, Intel.
         // "gdi": last resort - GDI desktop capture needs no DXGI output at all, and on some hybrid-GPU
         // systems DXGI exposes none, which makes every ddagrab / DuplicateOutput mode above fail.
+        // The three gdi rungs differ only in encoder: the one matching the GPU that drives the display is
+        // tried first (AMF on the AMD iGPU here, so games on the dGPU keep their 3D engine).
         #[cfg(windows)]
-        let all = ["gpu", "cpu", "cpu-nvenc", "cpu-qsv", "gdi", "gdi-x264"];
+        let all = ["gpu", "cpu", "cpu-nvenc", "cpu-qsv", "gdi", "gdi-nvenc", "gdi-x264"];
         #[cfg(not(windows))]
         let all = ["gpu"];
         let mode_file = std::env::temp_dir().join("clipper_mode_v7.txt");
@@ -3120,10 +3122,21 @@ impl Recorder {
         // the graphics card's own encoder first among the fallbacks (Intel -> Quick Sync, NVIDIA -> NVENC)
         #[cfg(windows)]
         {
-            let first = match crate::gpucap::monitor_vendor(&cfg.monitor) { 0x10DE => Some(2), 0x8086 => Some(3), _ => None };
+            let vendor = crate::gpucap::monitor_vendor(&cfg.monitor);
+            let first = match vendor { 0x10DE => Some(2), 0x8086 => Some(3), _ => None };
             if let Some(f) = first {
                 order.retain(|&i| i != f);
                 order.insert(1, f);
+            }
+            // same idea for the gdi rungs (4 = AMF, 5 = NVENC, 6 = x264): the GPU that drives the
+            // display encodes first, so a game rendering on the other GPU keeps its 3D engine
+            let pref: [usize; 3] = if vendor == 0x10DE { [5, 4, 6] } else { [4, 5, 6] };
+            let mut k = 0;
+            for i in order.iter_mut() {
+                if *i >= 4 {
+                    *i = pref[k];
+                    k += 1;
+                }
             }
         }
         if last > 0 && last < all.len() {
@@ -3154,14 +3167,17 @@ impl Recorder {
                 let buf = format!("{}M", cfg.bitrate_mbps * 2);
                 let rc: Vec<&str> = match (mode, cfg.smart_bitrate) {
                     ("gdi-x264", _) => vec![], // libx264 has no -rc; -b:v below is its CBR target
-                    ("gdi", true) | ("cpu-nvenc", true) => vec!["-rc", "vbr", "-maxrate", &peak, "-bufsize", &buf],
+                    ("gdi", true) => vec!["-rc", "vbr_peak", "-maxrate", &peak],
+                    ("gdi", false) => vec!["-rc", "cbr"],
+                    ("gdi-nvenc", true) | ("cpu-nvenc", true) => vec!["-rc", "vbr", "-maxrate", &peak, "-bufsize", &buf],
                     ("cpu-qsv", true) => vec!["-maxrate", &peak, "-bufsize", &buf],
                     (_, true) => vec!["-rc", "vbr_peak", "-maxrate", &peak],
                     ("cpu-nvenc", false) | (_, false) if mode != "cpu-qsv" => vec!["-rc", "cbr"],
                     _ => vec![],
                 };
                 let mut enc: Vec<String> = match mode {
-                    "gdi" => vec!["-c:v".into(), format!("{c}_nvenc"), "-preset".into(), "p3".into(), "-tune".into(), "ll".into()],
+                    "gdi" => vec!["-c:v".into(), format!("{c}_amf"), "-quality".into(), "speed".into()],
+                    "gdi-nvenc" => vec!["-c:v".into(), format!("{c}_nvenc"), "-preset".into(), "p3".into(), "-tune".into(), "ll".into()],
                     "gdi-x264" => vec!["-c:v".into(), "libx264".into(), "-preset".into(), "ultrafast".into(), "-tune".into(), "zerolatency".into()],
                     "cpu-nvenc" => vec!["-c:v".into(), format!("{c}_nvenc"), "-preset".into(), "p3".into(), "-tune".into(), "ll".into()],
                     "cpu-qsv" => vec!["-c:v".into(), format!("{c}_qsv"), "-preset".into(), "veryfast".into()],
